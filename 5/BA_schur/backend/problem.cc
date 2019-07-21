@@ -382,7 +382,10 @@ void Problem::SolveLinearSystem() {
         }
 
         // TODO:: home work. 完成舒尔补 Hpp, bpp 代码
-        MatXX tempH = Hpm * Hmm_inv;
+        // 计算b_pp_schur和H_pp_schu 时都需要用到的矩阵块 Hpm * Hmm_inv
+        MatXX Hpm_Hmm = Hpm * Hmm_inv;
+        H_pp_schur = Hessian_.block(0,0,reserve_size, reservice_size) - Hpm_Hmm * Hmp;
+        b_pp_schur = bpp - Hpm_Hmm * Hmm_inv;
         // H_pp_schur_ = Hessian_.block(?,?,?,?) - tempH * Hmp;
         // b_pp_schur_ = bpp - ? * ?;
 
