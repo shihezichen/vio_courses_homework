@@ -8,35 +8,19 @@
 #include "backend/problem.h"
 #include "utility/tic_toc.h"
 
-// 编译选项  To Do: 此处使用变量定义, 未来可改成使用配置文件保存
-
-// 控制使用LM 或者Dogleg,   0: LM,   1: Dogleg
-const int alogrithm_option = 1;  
-
+// 编译选项
+// 控制使用LM 或者Dogleg
+const int alogrithm_option = 1;   // 0: LM,   1: Dogleg
 // 控制是否使用加速, 以及加速方式
-//   0: Normal,non-acc,   1: OpenMP acc,   2: Multi Threads acc
-const int acc_option = 1;  
-
+const int acc_option = 0;  // 0: Normal,non-acc,   1: OpenMP acc,   2: Multi Threads acc
 // 控制LM算法中的IsGoodStep的策略(不影响Dogleg)
-//   0: 原策略;  1: 原策略;  2: 新策略(主选);   3: 新策略(不建议)
-const int lm_strategy_option = 2;  
-
-// 控制Dogleg法中的IsGoodStep的策略
-//   0: 论文的rho_计算策略;  1: 和g2o一致的rho_计算策略
-const int dogleg_strategy_option = 1; 
-
+const int lm_strategy_option = 2;  // 0: 原策略;  1: 原策略;  2: 新策略(主选);   3: 新策略(不建议)
 // 控制 LM 或者 Dogleg 算法的chi和lambda初始化选项
-//   0:Nielsen; 1:Levenberg;  2:Marquardt;  3:Quadratic;  4:Doglet
-const int chi_lambda_init_option = 4;   
+const int chi_lambda_init_option = 4;   // 0:Nielsen; 1:Levenberg;  2:Marquardt;  3:Quadratic;  4:Doglet
    
-//#ifdef USE_OPENMP
+#ifdef USE_OPENMP
 #include <omp.h>
-// 针对 MatXX类型和 VecX 等复杂类型, 实现 自定义 reduction 
-#pragma omp declare reduction (+: VecX: omp_out=omp_out+omp_in)\
-     initializer(omp_priv=VecX::Zero(omp_orig.size()))
-#pragma omp declare reduction (+: MatXX: omp_out=omp_out+omp_in)\
-     initializer(omp_priv=MatXX::Zero(omp_orig.rows(), omp_orig.cols()))
-//#endif
+#endif
 
 using namespace std;
 
@@ -196,8 +180,9 @@ bool Problem::RemoveEdge(std::shared_ptr<Edge> edge) {
 // 负责负责进行LM或者Dogleg算法的选择和分发
 bool Problem::Solve(int iterations){
     bool result = false;
-    // 算法选项
-    int option = alogrithm_option;   // 0: LM,   1: Dogleg 
+
+    // To Do: 此处使用一个变量保存所使用的策略, 未来可以变为外部配置文件中的配置项
+    int option = alogrithm_option;   
     switch(option) {  
         case 0: result = SolveLM(iterations);
                 break;
@@ -249,7 +234,8 @@ bool Problem::SolveDogleg(int iterations) {
         while (!oneStepSuccess && false_cnt < 10)  // 不断尝试 Lambda, 直到成功迭代一步
         {
             // 计算alpha 和 h_gn 
-            double alpha_ = b_.squaredNorm() / ( (Hessian_ * b_).dot(b_) );
+            VecX auxVector1 = Hessian_ * b_;
+            double alpha_ = b_.squaredNorm() / auxVector1.dot(b_);
             //alpha_ = b_.squaredNorm() / (b_.transpose()*Hessian_*b_);
             h_sd_ = alpha_ * b_;
             // To Do: 此处Hessian_比较大, 直接求逆很耗时, 可采用 Gauss-Newton法求解
@@ -258,19 +244,21 @@ bool Problem::SolveDogleg(int iterations) {
 
             double h_sd_norm = h_sd_.norm();
             double h_gn_norm = h_gn_.norm();
+
             // 计算h_dl 步长
             if ( h_gn_norm <= radius_){
                 h_dl_ = h_gn_;
             // 此处条件判断直接用了 h_sd_norm, 和论文的 alpha_*h_sd_norm不同
-            }else if ( alpha_*h_sd_norm >= radius_ ) { 
-                h_dl_ = ( radius_ / h_sd_norm ) * h_sd_;
+            }else if ( h_sd_norm >= radius_ ) { 
+                // 此处条件判断 直接用了 h_sd_norm, 和论文的 alpha_*h_sd_norm不同
+                h_dl_ = ( radius_ / h_sd_.norm() ) * h_sd_;
             } else {
                 // 计算beta用于更新步长(此处a直接等于 h_sd_, 和论文的 alpha_* h_sd_ 有所不同)
                 //VecX a = alpha_ * h_sd_;            
                 VecX a  = h_sd_;
                 VecX b = h_gn_;
                 //double c = a.transpose() * (b - a);
-                double c = a.dot( b - a );
+                  double c = h_sd_.dot( b - a );
                 if (c <= 0){
                     beta_ = ( -c + sqrt(c*c + (b-a).squaredNorm() * (radius_*radius_ - a.squaredNorm())) )
                              / (b - a).squaredNorm();
@@ -334,33 +322,19 @@ bool Problem::IsGoodStepInDogleg(){
     tempChi *= 0.5;          // 1/2 * err^2
 
     // 计算rho
-    double rho_ ;
-    int option = dogleg_strategy_option;  // 0: 论文策略;  1: 和g2o一致的策略
-    switch ( option ) {
-        case 0:{  // 论文策略, 计算 rho 
-            // scale 即为论文中的 L(0) - L(h_dl), 参看 论文 4°和 3.20a 的公式说明
-            double scale=0.0;
-            if(h_dl_ == h_gn_){
-                scale = currentChi_;
-            } else if(h_dl_ == radius_ * b_ / b_.norm()) {
-                scale = radius_ * (2 * (alpha_ * b_).norm() - radius_) / (2 * alpha_);
-            } else { 
-                scale = 0.5 * alpha_ * pow( (1 - beta_), 2) * b_.squaredNorm() 
-                            + beta_ * (2 - beta_) * currentChi_;
-            }
-            // rho = ( F(x) - F(x_new) ) / ( L(0) - L(h_dl) )
-            rho_ = ( currentChi_ - tempChi )/ scale;
-            break;
-        }
-        case 1: {  // 按照 g2o 方式 计算 rho_
-            double linearGain = - double(delta_x_.transpose() * Hessian_ * delta_x_) 
-                                    + 2 * b_.dot(delta_x_);
-            rho_ = ( currentChi_ - tempChi ) / linearGain;
-            break;
-        }
+    double scale=0.0;
+    if(h_dl_ == h_gn_){
+        scale = currentChi_;
+    } else if(h_dl_ == radius_ * b_ / b_.norm()) {
+        scale = radius_ * (2 * (alpha_ * b_).norm() - radius_) / (2 * alpha_);
+    } else { 
+         scale = 0.5 * alpha_ * pow( (1 - beta_), 2) * b_.squaredNorm() 
+                    + beta_ * (2 - beta_) * currentChi_;
     }
 
-    // 以下 按照 论文方式更新 radius_
+    double nonLinearGain = currentChi_ - tempChi; 
+    double linearGain = - double(delta_x_.transpose() * Hessian_ * delta_x_) + 2 * b_.dot(delta_x_);
+    double rho_ = nonLinearGain / linearGain;
     if (rho_ > 0.75 && isfinite(tempChi)) {
         radius_ = std::max(radius_, 3 * delta_x_.norm());
     }
@@ -369,12 +343,34 @@ bool Problem::IsGoodStepInDogleg(){
     } else {
         // do nothing
     }
-    if (rho_ > 0 && isfinite(tempChi)) {
+
+   if (rho_ > 0 && isfinite(tempChi)) {
         currentChi_ = tempChi;
         return true;
     } else {
         return false;
     }
+
+    //以下为根据论文的策略
+    // double rho = (currentChi_ - tempChi) / scale;
+    // if(rho > 0 && isfinite(tempChi))
+    // {
+    //     delta_x_ = delta_x_ + h_dl_;
+    //     currentChi_ = tempChi;
+    //     return true;
+    // }
+    // if(rho > 3.0/4.0 && isfinite(tempChi)) 
+    // {
+    //     radius_ = max(radius_, 3*h_dl_.norm());
+    //     return false;
+    // }  
+    // else if(rho < 1.0/4.0 && isfinite(tempChi)) 
+    // {
+    //     radius_ = radius_ / 2.0; 
+    //     return false;
+    // } else {
+    //     return false;
+    // }
 }
 
 // Chi 和 Lambda 初始化
@@ -420,25 +416,39 @@ void Problem::ComputeChiInitAndLambdaInit()
             break;
     }
 }
+
+/// LM
 void Problem::ComputeLambdaInitLM_Nielsen() {
     ni_ = 2.;
+    
     stopThresholdLM_ = 1e-10 * currentChi_;          // 迭代条件为 误差下降 1e-6 倍
+
     double tau = 1e-5;  // 1e-5
     currentLambda_ = tau * maxDiagonal_;
     std::cout << "currentLamba_: "<<currentLambda_<<", maxDiagonal: "<<maxDiagonal_<<std::endl;
 }
+
+/// LM
 void Problem::ComputeLambdaInitLM_Levenberg() {
     currentLambda_ = 1e-2;
+
     lastLambda_ = currentLambda_;
+//  std::cout << "currentLamba_: "<<maxDiagonal<<" "<<currentLambda_<<std::endl;
 }
+
 void Problem::ComputeLambdaInitLM_Marquardt() {
     double tau = 1e-5;  // 1e-5
     currentLambda_ = tau * maxDiagonal_;
+
+    //currentLambda_ = 1e-2;
+//  std::cout << "currentLamba_: "<<maxDiagonal<<" "<<currentLambda_<<std::endl;
 }
+
 void Problem::ComputeLambdaInitLM_Quadratic() {
     double tau = 1e-5;  // 1e-5
     currentLambda_ = tau * maxDiagonal_;
 }
+
 void Problem::ComputeLambdaInitDogleg() {
     currentLambda_ = 1e-7;
 }
@@ -705,10 +715,7 @@ void Problem::MakeHessianWithOpenMP() {
 
     //for (auto &edge: edges_) {
     // 由于openmp严格要求for循环下标必须是整数, 因此需要改写为如下形式
-    omp_set_num_threads(4);
-    Eigen::setNbThreads(1);
-    #pragma omp parallel for reduction(+: H) reduction(+: b) 
-    //#pragma omp parallel for num_threads(4) 
+    #pragma omp parallel for num_threads(4) 
     for(unsigned int idx=0; idx < edges_.size(); idx++ ) {
         // 使用如下方法得到当前第 idx 个元素
         // 1. 使用第idx个位置上预先保存的id取到对应的edge
@@ -766,8 +773,7 @@ void Problem::MakeHessianWithOpenMP() {
                     H.block(index_j, index_i, dim_j, dim_i).noalias() += hessian.transpose();
                 }
             }
-            // 上面使用了 reduction 后, 就不用再使用 critical 来控制并发访问
-            //#pragma omp critical 
+            #pragma omp critical 
             b.segment(index_i, dim_i).noalias() -= drho * jacobian_i.transpose()* edge->Information() * edge->Residual();
         }
     }
@@ -798,8 +804,6 @@ void Problem::MakeHessianWithOpenMP() {
     }
 
     delta_x_ = VecX::Zero(size);  // initial delta_x = 0_n;
-
-    Eigen::setNbThreads(4);
 }
 
 // 线程函数, 负责处理一部分的edges, 然后拼装到大矩阵H中和b中
